@@ -65,12 +65,10 @@ pub use app_crypto::RuntimeAppPublic;
 /// Re-export top-level arithmetic stuff.
 pub use arithmetic::{
 	Perquintill, Perbill, Permill, Percent,
-	Rational128, Fixed64
+	Rational128, Fixed64, BigUint
 };
 /// Re-export 128 bit helpers.
 pub use arithmetic::helpers_128bit;
-/// Re-export big_uint stuff.
-pub use arithmetic::biguint;
 /// Re-export error rate macro.
 #[cfg(feature = "std")]
 pub use arithmetic::assert_eq_error_rate;

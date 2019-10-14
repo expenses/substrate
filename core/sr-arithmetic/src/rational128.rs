@@ -15,7 +15,7 @@
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
 use rstd::{cmp::Ordering, prelude::*};
-use crate::helpers_128bit;
+use crate::{helpers_128bit, BigUint};
 use num_traits::Zero;
 
 /// A wrapper for any rational number with a 128 bit numerator and denominator.
@@ -138,8 +138,8 @@ impl Ord for Rational128 {
 			Ordering::Less
 		} else {
 			// Don't even compute gcd.
-			let self_n = helpers_128bit::to_big_uint(self.0) * helpers_128bit::to_big_uint(other.1);
-			let other_n = helpers_128bit::to_big_uint(other.0) * helpers_128bit::to_big_uint(self.1);
+			let self_n = BigUint::from(self.0) * BigUint::from(other.1);
+			let other_n = BigUint::from(other.0) * BigUint::from(self.1);
 			self_n.cmp(&other_n)
 		}
 	}
@@ -151,8 +151,8 @@ impl PartialEq for Rational128 {
 		if self.1 == other.1 {
 			self.0.eq(&other.0)
 		} else {
-			let self_n = helpers_128bit::to_big_uint(self.0) * helpers_128bit::to_big_uint(other.1);
-			let other_n = helpers_128bit::to_big_uint(other.0) * helpers_128bit::to_big_uint(self.1);
+			let self_n = BigUint::from(self.0) * BigUint::from(other.1);
+			let other_n = BigUint::from(other.0) * BigUint::from(self.1);
 			self_n.eq(&other_n)
 		}
 	}
@@ -357,7 +357,7 @@ mod tests {
 		);
 		assert_eq!(
 			multiply_by_rational(1_000_000_000, MAX128 / 8, MAX128 / 2).unwrap(),
-			250000000,
+			249999999,
 		);
 	}
 

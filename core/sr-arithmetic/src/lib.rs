@@ -22,7 +22,6 @@
 #![cfg_attr(feature = "bench", feature(test))]
 #[cfg(feature = "bench")] extern crate test;
 
-pub mod biguint;
 pub mod helpers_128bit;
 pub mod traits;
 mod parts_per_x;
@@ -32,3 +31,4 @@ mod rational128;
 pub use fixed64::Fixed64;
 pub use parts_per_x::{Percent, Permill, Perbill, Perquintill};
 pub use rational128::Rational128;
+pub use num_bigint::BigUint;
