@@ -23,7 +23,61 @@ use sr_primitives::traits::SimpleArithmetic;
 use codec::{Encode, Decode};
 use crate::error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+enum Change<H> {
+	Added(H), Removed
+}
+
+pub struct LeafSetChanges<H, N> {
+	pending: BTreeMap<LeafSetItem<H, N>, Change<H>>
+}
+
+impl<H, N> LeafSetChanges<H, N> where
+	H: Clone + PartialEq + Decode + Encode + Ord,
+	N: std::fmt::Debug + Clone + SimpleArithmetic + Decode + Encode + Ord,
+{
+	pub fn new() -> Self {
+		Self {
+			pending: BTreeMap::new()
+		}
+	}
+
+	/// Write the leaf list to the database transaction.
+	pub fn prepare(&mut self, tx: &mut DBTransaction, column: Option<u32>, prefix: &[u8]) {
+		let mut buf = prefix.to_vec();
+		for (LeafSetItem { hash, number }, change) in self.pending.iter() {
+			hash.using_encoded(|s| buf.extend(s));
+
+			match change {
+				Change::Added(_) => tx.put_vec(column, &buf[..], number.0.encode()),
+				Change::Removed => tx.delete(column, &buf[..])
+			}
+
+			buf.truncate(prefix.len()); // reuse allocation.
+		}
+	}
+
+	pub fn contains(&mut self, number: N, hash: H) -> bool {
+		match self.pending.get(&LeafSetItem { number: Reverse(number), hash }) {
+			Some(Change::Added(_)) => true,
+			_ => false
+		}
+	}
+
+	pub fn import(&mut self, hash: H, number: N, parent_hash: H) {
+		self.pending.insert(LeafSetItem { hash, number: Reverse(number) }, Change::Added(parent_hash));
+	}
+
+	pub fn finalize_height(&mut self, height: N) {
+		let height = Reverse(height);
+		for (item, change) in self.pending.iter_mut() {
+			if item.number > height {
+				*change = Change::Removed;
+			}
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 struct LeafSetItem<H, N> {
 	hash: H,
 	number: Reverse<N>,
@@ -59,8 +113,6 @@ impl<H, N: Ord> FinalizationDisplaced<H, N> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafSet<H, N> {
 	storage: BTreeMap<Reverse<N>, Vec<H>>,
-	pending_added: Vec<LeafSetItem<H, N>>,
-	pending_removed: Vec<H>,
 }
 
 impl<H, N> LeafSet<H, N> where
@@ -71,8 +123,23 @@ impl<H, N> LeafSet<H, N> where
 	pub fn new() -> Self {
 		Self {
 			storage: BTreeMap::new(),
-			pending_added: Vec::new(),
-			pending_removed: Vec::new(),
+		}
+	}
+
+	pub fn apply(&mut self, changes: &mut LeafSetChanges<H, N>) {
+		for (LeafSetItem {number, hash}, change) in &changes.pending {
+			match change {
+				Change::Added(parent_hash) => {
+					self.import(hash.clone(), number.0.clone(), parent_hash.clone());
+				},
+				Change::Removed => {
+					if let Some(hashes) = self.storage.get_mut(&number) {
+						if let Some(position) = hashes.iter().position(|h| h == hash) {
+							hashes.remove(position);
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -95,8 +162,6 @@ impl<H, N> LeafSet<H, N> where
 		}
 		Ok(Self {
 			storage,
-			pending_added: Vec::new(),
-			pending_removed: Vec::new(),
 		})
 	}
 
@@ -108,7 +173,7 @@ impl<H, N> LeafSet<H, N> where
 			let was_displaced = self.remove_leaf(&new_number, &parent_hash);
 
 			if was_displaced {
-				self.pending_removed.push(parent_hash.clone());
+				//self.pending_removed.push(parent_hash.clone());
 				Some(ImportDisplaced {
 					new_hash: hash.clone(),
 					displaced: LeafSetItem {
@@ -124,7 +189,7 @@ impl<H, N> LeafSet<H, N> where
 		};
 
 		self.insert_leaf(Reverse(number.clone()), hash.clone());
-		self.pending_added.push(LeafSetItem { hash, number: Reverse(number) });
+		//self.pending_added.push(LeafSetItem { hash, number: Reverse(number) });
 		displaced
 	}
 
@@ -142,7 +207,7 @@ impl<H, N> LeafSet<H, N> where
 		};
 
 		let below_boundary = self.storage.split_off(&Reverse(boundary));
-		self.pending_removed.extend(below_boundary.values().flat_map(|h| h.iter()).cloned());
+		//self.pending_removed.extend(below_boundary.values().flat_map(|h| h.iter()).cloned());
 		FinalizationDisplaced {
 			leaves: below_boundary,
 		}
@@ -170,21 +235,6 @@ impl<H, N> LeafSet<H, N> where
 	/// ordered by their block number descending.
 	pub fn hashes(&self) -> Vec<H> {
 		self.storage.iter().flat_map(|(_, hashes)| hashes.iter()).cloned().collect()
-	}
-
-	/// Write the leaf list to the database transaction.
-	pub fn prepare_transaction(&mut self, tx: &mut DBTransaction, column: Option<u32>, prefix: &[u8]) {
-		let mut buf = prefix.to_vec();
-		for LeafSetItem { hash, number } in self.pending_added.drain(..) {
-			hash.using_encoded(|s| buf.extend(s));
-			tx.put_vec(column, &buf[..], number.0.encode());
-			buf.truncate(prefix.len()); // reuse allocation.
-		}
-		for hash in self.pending_removed.drain(..) {
-			hash.using_encoded(|s| buf.extend(s));
-			tx.delete(column, &buf[..]);
-			buf.truncate(prefix.len()); // reuse allocation.
-		}
 	}
 
 	#[cfg(test)]
@@ -219,6 +269,7 @@ impl<H, N> LeafSet<H, N> where
 
 		removed
 	}
+	pub fn prepare_transaction(&mut self, tx: &mut DBTransaction, column: Option<u32>, prefix: &[u8]) {}
 }
 
 /// Helper for undoing operations.
@@ -245,8 +296,8 @@ impl<'a, H: 'a, N: 'a> Undo<'a, H, N> where
 
 impl<'a, H: 'a, N: 'a> Drop for Undo<'a, H, N> {
 	fn drop(&mut self) {
-		self.inner.pending_added.clear();
-		self.inner.pending_removed.clear();
+		//self.inner.pending_added.clear();
+		//self.inner.pending_removed.clear();
 	}
 }
 
@@ -257,18 +308,21 @@ mod tests {
 	#[test]
 	fn it_works() {
 		let mut set = LeafSet::new();
-		set.import(0u32, 0u32, 0u32);
+		let mut changes = LeafSetChanges::new();
+		changes.import(0u32, 0u32, 0u32);
 
-		set.import(1_1, 1, 0);
-		set.import(2_1, 2, 1_1);
-		set.import(3_1, 3, 2_1);
+		changes.import(1_1, 1, 0);
+		changes.import(2_1, 2, 1_1);
+		changes.import(3_1, 3, 2_1);
+		set.apply(&mut changes);
 
 		assert!(set.contains(3, 3_1));
 		assert!(!set.contains(2, 2_1));
 		assert!(!set.contains(1, 1_1));
 		assert!(!set.contains(0, 0));
 
-		set.import(2_2, 2, 1_1);
+		changes.import(2_2, 2, 1_1);
+		set.apply(&mut changes);
 
 		assert!(set.contains(3, 3_1));
 		assert!(set.contains(2, 2_2));
@@ -280,17 +334,18 @@ mod tests {
 		let db = ::kvdb_memorydb::create(0);
 
 		let mut set = LeafSet::new();
-		set.import(0u32, 0u32, 0u32);
+		let mut changes = LeafSetChanges::new();
+		changes.import(0u32, 0u32, 0u32);
 
-		set.import(1_1, 1, 0);
-		set.import(2_1, 2, 1_1);
-		set.import(3_1, 3, 2_1);
-
+		changes.import(1_1, 1, 0);
+		changes.import(2_1, 2, 1_1);
+		changes.import(3_1, 3, 2_1);
 		let mut tx = DBTransaction::new();
 
-		set.prepare_transaction(&mut tx, None, PREFIX);
+		changes.prepare(&mut tx, None, PREFIX);
 		db.write(tx).unwrap();
 
+		set.apply(&mut changes);
 		let set2 = LeafSet::read_from_db(&db, None, PREFIX).unwrap();
 		assert_eq!(set, set2);
 	}
@@ -314,22 +369,24 @@ mod tests {
 		let db = ::kvdb_memorydb::create(0);
 
 		let mut set = LeafSet::new();
-		set.import(10_1u32, 10u32, 0u32);
-		set.import(11_1, 11, 10_2);
-		set.import(11_2, 11, 10_2);
-		set.import(12_1, 12, 11_123);
+		let mut changes = LeafSetChanges::new();
+		changes.import(10_1u32, 10u32, 0u32);
+		changes.import(11_1, 11, 10_2);
+		changes.import(11_2, 11, 10_2);
+		changes.import(12_1, 12, 11_123);
 
-		assert!(set.contains(10, 10_1));
+		assert!(changes.contains(10, 10_1));
 
 		let mut tx = DBTransaction::new();
-		set.prepare_transaction(&mut tx, None, PREFIX);
+		changes.prepare(&mut tx, None, PREFIX);
 		db.write(tx).unwrap();
 
-		let _ = set.finalize_height(11);
+		changes.finalize_height(11);
 		let mut tx = DBTransaction::new();
-		set.prepare_transaction(&mut tx, None, PREFIX);
+		changes.prepare(&mut tx, None, PREFIX);
 		db.write(tx).unwrap();
 
+		set.apply(&mut changes);
 		assert!(set.contains(11, 11_1));
 		assert!(set.contains(11, 11_2));
 		assert!(set.contains(12, 12_1));
