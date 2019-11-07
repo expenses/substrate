@@ -17,12 +17,12 @@
 //! Test utilities
 
 use std::{collections::HashSet, cell::RefCell};
-use sr_primitives::Perbill;
+use sr_primitives::{Perbill, KeyTypeId};
 use sr_primitives::curve::PiecewiseLinear;
 use sr_primitives::traits::{IdentityLookup, Convert, OpaqueKeys, OnInitialize, SaturatedConversion};
 use sr_primitives::testing::{Header, UintAuthorityId};
 use sr_staking_primitives::SessionIndex;
-use primitives::H256;
+use primitives::{H256, crypto::key_types};
 use runtime_io;
 use support::{assert_ok, impl_outer_origin, parameter_types, StorageLinkedMap};
 use support::traits::{Currency, Get, FindAuthor};
@@ -52,6 +52,8 @@ thread_local! {
 
 pub struct TestSessionHandler;
 impl session::SessionHandler<AccountId> for TestSessionHandler {
+	const KEY_TYPE_IDS: &'static [KeyTypeId] = &[key_types::DUMMY];
+
 	fn on_genesis_session<Ks: OpaqueKeys>(_validators: &[(AccountId, Ks)]) {}
 
 	fn on_new_session<Ks: OpaqueKeys>(
@@ -190,12 +192,13 @@ parameter_types! {
 	pub const SessionsPerEra: SessionIndex = 3;
 	pub const BondingDuration: EraIndex = 3;
 	pub const RewardCurve: &'static PiecewiseLinear<'static> = &I_NPOS;
+	pub const MaxReward: Perbill = Perbill::from_percent(10);
 }
 impl Trait for Test {
 	type Currency = balances::Module<Self>;
 	type Time = timestamp::Module<Self>;
 	type CurrencyToVote = CurrencyToVoteHandler;
-	type OnRewardMinted = ();
+	type RewardRemainder = ();
 	type Event = ();
 	type Slash = ();
 	type Reward = ();
@@ -203,6 +206,7 @@ impl Trait for Test {
 	type BondingDuration = BondingDuration;
 	type SessionInterface = Self;
 	type RewardCurve = RewardCurve;
+	type MaxPossibleReward = MaxReward;
 }
 
 pub struct ExtBuilder {

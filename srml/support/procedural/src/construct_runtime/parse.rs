@@ -162,12 +162,12 @@ impl ModuleDeclaration {
 
 	fn default_modules(span: Span) -> Vec<ModulePart> {
 		let mut res: Vec<_> = ["Module", "Call", "Storage"]
-			.into_iter()
+			.iter()
 			.map(|name| ModulePart::with_name(name, span))
 			.collect();
 		res.extend(
 			["Event", "Config"]
-				.into_iter()
+				.iter()
 				.map(|name| ModulePart::with_generics(name, span)),
 		);
 		res

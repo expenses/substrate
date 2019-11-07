@@ -17,24 +17,15 @@
 mod parse;
 
 use parse::{ModuleDeclaration, ModulePart, RuntimeDefinition, WhereSection};
-use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+//use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use srml_support_procedural_tools::syn_ext as ext;
 use srml_support_procedural_tools::{generate_crate_access, generate_hidden_includes};
 use syn::Ident;
+use syn::token::Brace;
 
-// try macro but returning tokenized error
-macro_rules! try_tok(( $expre : expr ) => {
-	match $expre {
-		Ok(r) => r,
-		Err (err) => {
-			return err.to_compile_error().into()
-		}
-	}
-});
-
-pub fn construct_runtime(input: TokenStream) -> TokenStream {
+pub fn construct_runtime(input: syn::export::TokenStream) -> syn::export::TokenStream {
 	let definition = syn::parse_macro_input!(input as RuntimeDefinition);
 	let RuntimeDefinition {
 		name,
@@ -52,37 +43,42 @@ pub fn construct_runtime(input: TokenStream) -> TokenStream {
 	} = definition;
 
 	// Assert we have system module declared
-	let system_module = match find_system_module(modules.iter()) {
-		Some(sm) => sm,
-		None => {
-			return syn::Error::new(
-				modules_token.span,
-				"`System` module declaration is missing. \
-				 Please add this line: `System: system::{Module, Call, Storage, Config, Event},`",
-			)
-			.to_compile_error()
-			.into()
-		}
+	let system_module = match find_system_module(modules.iter(), modules_token) {
+		Ok(module) => module,
+		Err(err) => return err.to_compile_error().into()
 	};
 
 	let hidden_crate_name = "construct_runtime";
 	let scrate = generate_crate_access(&hidden_crate_name, "srml-support");
 	let scrate_decl = generate_hidden_includes(&hidden_crate_name, "srml-support");
-	let outer_event = try_tok!(decl_outer_event_or_origin(
+
+	let outer_event = match decl_outer_event_or_origin(
 		&name,
-		modules.iter().filter(|module| module.name != "System"),
+		modules.iter(),
 		&system_module,
 		&scrate,
 		DeclOuterKind::Event,
-	));
-	let outer_origin = try_tok!(decl_outer_event_or_origin(
+	) {
+		Ok(outer_event) => outer_event,
+		Err(err) => return err.to_compile_error().into()
+	};
+
+
+	let outer_origin = match decl_outer_event_or_origin(
 		&name,
-		modules.iter().filter(|module| module.name != "System"),
+		modules.iter(),
 		&system_module,
 		&scrate,
 		DeclOuterKind::Origin,
-	));
-	let all_modules = decl_all_modules(&name, modules.iter().filter(|module| module.name != "System"));
+	) {
+		Ok(outer_origin) => outer_origin,
+		Err(err) => return err.to_compile_error().into()
+	};
+
+	let all_modules = decl_all_modules(
+		&name,
+		modules.iter().filter(|module| module.name != "System")
+	);
 
 	let dispatch = decl_outer_dispatch(&name, modules.iter(), &scrate);
 	let metadata = decl_runtime_metadata(&name, modules.iter(), &scrate);
@@ -90,7 +86,7 @@ pub fn construct_runtime(input: TokenStream) -> TokenStream {
 	let inherent = decl_outer_inherent(&block, &unchecked_extrinsic, modules.iter(), &scrate);
 	let validate_unsigned = decl_validate_unsigned(&name, modules.iter(), &scrate);
 
-	let res: TokenStream = quote!(
+	quote!(
 		#scrate_decl
 
 		#[derive(Clone, Copy, PartialEq, Eq)]
@@ -118,23 +114,17 @@ pub fn construct_runtime(input: TokenStream) -> TokenStream {
 		#inherent
 
 		#validate_unsigned
-	)
-	.into();
-
-	res
+	).into()
 }
 
 fn decl_validate_unsigned<'a>(
 	runtime: &'a Ident,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-	scrate: &'a TokenStream2,
-) -> TokenStream2 {
+	scrate: &'a TokenStream,
+) -> TokenStream {
 	let modules_tokens = module_declarations
 		.filter(|module_declaration| {
-			module_declaration
-				.module_parts()
-				.into_iter()
-				.any(|part| part.name == "ValidateUnsigned")
+			filter_module_parts(module_declaration, "ValidateUnsigned").next().is_some()
 		})
 		.map(|module_declaration| &module_declaration.name);
 	quote!(
@@ -150,13 +140,10 @@ fn decl_outer_inherent<'a>(
 	block: &'a syn::TypePath,
 	unchecked_extrinsic: &'a syn::TypePath,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-	scrate: &'a TokenStream2,
-) -> TokenStream2 {
+	scrate: &'a TokenStream,
+) -> TokenStream {
 	let modules_tokens = module_declarations.filter_map(|module_declaration| {
-		let maybe_config_part = module_declaration
-			.module_parts()
-			.into_iter()
-			.filter(|part| part.name == "Inherent")
+		let maybe_config_part = filter_module_parts(module_declaration, "Inherent")
 			.next();
 		maybe_config_part.map(|config_part| {
 			let arg = config_part
@@ -181,17 +168,14 @@ fn decl_outer_inherent<'a>(
 fn decl_outer_config<'a>(
 	runtime: &'a Ident,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-	scrate: &'a TokenStream2,
-) -> TokenStream2 {
+	scrate: &'a TokenStream,
+) -> TokenStream {
 	let modules_tokens = module_declarations
 		.filter_map(|module_declaration| {
-			let generics: Vec<_> = module_declaration
-				.module_parts()
-				.into_iter()
-				.filter(|part| part.name == "Config")
+			let generics: Vec<_> = filter_module_parts(module_declaration, "Config")
 				.map(|part| part.generics)
 				.collect();
-			if generics.len() == 0 {
+			if generics.is_empty() {
 				None
 			} else {
 				let transformed_generics: Vec<_> = generics[0].params.iter().map(|param| quote!(<#param>)).collect();
@@ -227,8 +211,8 @@ fn decl_outer_config<'a>(
 fn decl_runtime_metadata<'a>(
 	runtime: &'a Ident,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-	scrate: &'a TokenStream2,
-) -> TokenStream2 {
+	scrate: &'a TokenStream,
+) -> TokenStream {
 	let modules_tokens = module_declarations
 		.filter_map(|module_declaration| {
 			let parts = module_declaration.module_parts();
@@ -270,8 +254,8 @@ fn decl_runtime_metadata<'a>(
 fn decl_outer_dispatch<'a>(
 	runtime: &'a Ident,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-	scrate: &'a TokenStream2,
-) -> TokenStream2 {
+	scrate: &'a TokenStream,
+) -> TokenStream {
 	let modules_tokens = module_declarations
 		.filter(|module_declaration| {
 			find_module_entry(module_declaration, &Ident::new("Call", module_declaration.name.span())).is_some()
@@ -298,36 +282,33 @@ enum DeclOuterKind {
 
 fn decl_outer_event_or_origin<'a>(
 	runtime_name: &'a Ident,
-	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
+	modules: impl Iterator<Item=&'a ModuleDeclaration>,
 	system_name: &'a Ident,
-	scrate: &'a TokenStream2,
+	scrate: &'a TokenStream,
 	kind: DeclOuterKind,
-) -> syn::Result<TokenStream2> {
-	let mut modules_tokens = TokenStream2::new();
+) -> syn::Result<TokenStream> {
+	let mut modules_tokens = TokenStream::new();
 	let kind_str = format!("{:?}", kind);
-	for module_declaration in module_declarations {
+	for module_declaration in modules.filter(|module| module.name != "System") {
 		let kind_ident = Ident::new(kind_str.as_str(), module_declaration.name.span());
-		match find_module_entry(module_declaration, &kind_ident) {
-			Some(module_entry) => {
-				let module = &module_declaration.module;
-				let instance = module_declaration
-					.instance
-					.inner
-					.as_ref()
-					.map(|instance| &instance.name);
-				let generics = &module_entry.generics;
-				if instance.is_some() && generics.params.len() == 0 {
-					let msg = format!(
-						"Instantiable module with no generic `{}` cannot \
-						 be constructed: module `{}` must have generic `{}`",
-						kind_str, module_declaration.name, kind_str
-					);
-					return Err(syn::Error::new(module_declaration.name.span(), msg));
-				}
-				let tokens = quote!(#module #instance #generics ,);
-				modules_tokens.extend(tokens);
+		if let Some(module_entry) = find_module_entry(module_declaration, &kind_ident) {
+			let module = &module_declaration.module;
+			let instance = module_declaration
+				.instance
+				.inner
+				.as_ref()
+				.map(|instance| &instance.name);
+			let generics = &module_entry.generics;
+			if instance.is_some() && generics.params.is_empty() {
+				let msg = format!(
+					"Instantiable module with no generic `{}` cannot \
+					 be constructed: module `{}` must have generic `{}`",
+					kind_str, module_declaration.name, kind_str
+				);
+				return Err(syn::Error::new(module_declaration.name.span(), msg));
 			}
-			None => {}
+			let tokens = quote!(#module #instance #generics ,);
+			modules_tokens.extend(tokens);
 		}
 	}
 	let macro_call = match kind {
@@ -347,8 +328,8 @@ fn decl_outer_event_or_origin<'a>(
 fn decl_all_modules<'a>(
 	runtime: &'a Ident,
 	module_declarations: impl Iterator<Item = &'a ModuleDeclaration>,
-) -> TokenStream2 {
-	let mut types = TokenStream2::new();
+) -> TokenStream {
+	let mut types = TokenStream::new();
 	let mut names = Vec::new();
 	for module_declaration in module_declarations {
 		let type_name = &module_declaration.name;
@@ -382,14 +363,28 @@ fn decl_all_modules<'a>(
 	)
 }
 
-fn find_system_module<'a>(mut module_declarations: impl Iterator<Item = &'a ModuleDeclaration>) -> Option<&'a Ident> {
+fn find_system_module<'a>(mut module_declarations: impl Iterator<Item = &'a ModuleDeclaration>, modules_token: Brace) -> Result<&'a Ident, syn::Error> {
 	module_declarations
 		.find(|decl| decl.name == "System")
 		.map(|decl| &decl.module)
+		.ok_or_else(|| {
+			syn::Error::new(
+				modules_token.span,
+				"`System` module declaration is missing. \
+				 Please add this line: `System: system::{Module, Call, Storage, Config, Event},`",
+			)
+		})
 }
 
 fn find_module_entry<'a>(module_declaration: &'a ModuleDeclaration, name: &'a Ident) -> Option<ModulePart> {
 	let name_str = name.to_string();
 	let parts = module_declaration.module_parts();
 	parts.into_iter().find(|part| part.name == name_str)
+}
+
+fn filter_module_parts<'a>(module_declaration: &'a ModuleDeclaration, name: &'a str) -> impl Iterator<Item=ModulePart> + 'a {
+	module_declaration
+		.module_parts()
+		.into_iter()
+		.filter(move |part| part.name == name)
 }
