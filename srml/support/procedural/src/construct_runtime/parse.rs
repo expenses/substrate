@@ -38,21 +38,103 @@ pub struct RuntimeDefinition {
 	pub modules: ext::Braces<ext::Punctuated<ModuleDeclaration, Token![,]>>,
 }
 
-#[derive(Parse, ToTokens, Debug)]
+enum WhereLineToken {
+	Block,
+	NodeBlock,
+	UncheckedExtrinsic
+}
+
+impl Parse for WhereLineToken {
+	fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
+		if input.peek(keyword::Block) {
+			input.parse::<keyword::Block>()?;
+			Ok(Self::Block)
+		} else if input.peek(keyword::NodeBlock) {
+			input.parse::<keyword::NodeBlock>()?;
+			Ok(Self::NodeBlock)
+		} else if input.peek(keyword::UncheckedExtrinsic) {
+			input.parse::<keyword::UncheckedExtrinsic>()?;
+			Ok(Self::UncheckedExtrinsic)
+		} else {
+			Err(input.error("expected one of `Block`, `NodeBlock`, `UncheckedExtrinsic`"))
+		}
+	}
+}
+
+struct WhereLine {
+	token: WhereLineToken,
+	item: syn::TypePath
+}
+
+
+impl WhereLine {
+	fn set_options(
+		&self,
+		block: &mut Option<syn::TypePath>,
+		node_block: &mut Option<syn::TypePath>,
+		unchecked_extrinsic: &mut Option<syn::TypePath>
+	) {
+		match self.token {
+			WhereLineToken::Block => *block = Some(self.item.clone()),
+			WhereLineToken::NodeBlock => *node_block = Some(self.item.clone()),
+			WhereLineToken::UncheckedExtrinsic => *unchecked_extrinsic = Some(self.item.clone())
+		}
+	}
+}
+
+impl Parse for WhereLine {
+	fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
+		let token = input.parse()?;
+		input.parse::<Token![=]>()?;
+		let item = input.parse()?;
+		Ok(Self {
+			token, item
+		})
+	}
+}
+
+
+#[derive(ToTokens, Debug)]
 pub struct WhereSection {
-	pub token: Token![where],
-	pub block_token: keyword::Block,
-	pub block_eq: Token![=],
 	pub block: syn::TypePath,
-	pub block_sep: Token![,],
-	pub node_block_token: keyword::NodeBlock,
-	pub node_block_eq: Token![=],
 	pub node_block: syn::TypePath,
-	pub node_block_sep: Token![,],
-	pub unchecked_extrinsic_token: keyword::UncheckedExtrinsic,
-	pub unchecked_extrinsic_eq: Token![=],
 	pub unchecked_extrinsic: syn::TypePath,
-	pub trailing_comma: ext::Opt<Token![,]>,
+}
+
+impl Parse for WhereSection {
+	fn parse(input: syn::parse::ParseStream) -> syn::parse::Result<Self> {
+		let mut block = None;
+		let mut node_block = None;
+		let mut unchecked_extrinsic = None;
+
+		input.parse::<Token![where]>()?;
+
+		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
+		input.parse::<Token![,]>()?;
+		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
+		input.parse::<Token![,]>()?;
+		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
+		input.parse::<ext::Opt<Token![,]>>()?;
+
+		let block = match block {
+			Some(block) => block,
+			None => return Err(input.error("expected Block"))
+		};
+
+		let node_block = match node_block {
+			Some(node_block) => node_block,
+			None => return Err(input.error("expected NodeBlock"))
+		};
+
+		let unchecked_extrinsic = match unchecked_extrinsic {
+			Some(unchecked_extrinsic) => unchecked_extrinsic,
+			None => return Err(input.error("expected UncheckedExtrinsic"))
+		};
+
+		Ok(Self {
+			block, node_block, unchecked_extrinsic
+		})
+	}
 }
 
 #[derive(Parse, ToTokens, Debug)]
