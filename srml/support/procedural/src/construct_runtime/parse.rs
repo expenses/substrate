@@ -66,7 +66,6 @@ struct WhereLine {
 	item: syn::TypePath
 }
 
-
 impl WhereLine {
 	fn set_options(
 		&self,
@@ -108,7 +107,6 @@ impl Parse for WhereSection {
 		let mut unchecked_extrinsic = None;
 
 		input.parse::<Token![where]>()?;
-
 		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
 		input.parse::<Token![,]>()?;
 		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
@@ -116,23 +114,10 @@ impl Parse for WhereSection {
 		input.parse::<WhereLine>()?.set_options(&mut block, &mut node_block, &mut unchecked_extrinsic);
 		input.parse::<ext::Opt<Token![,]>>()?;
 
-		let block = match block {
-			Some(block) => block,
-			None => return Err(input.error("expected Block"))
-		};
-
-		let node_block = match node_block {
-			Some(node_block) => node_block,
-			None => return Err(input.error("expected NodeBlock"))
-		};
-
-		let unchecked_extrinsic = match unchecked_extrinsic {
-			Some(unchecked_extrinsic) => unchecked_extrinsic,
-			None => return Err(input.error("expected UncheckedExtrinsic"))
-		};
-
 		Ok(Self {
-			block, node_block, unchecked_extrinsic
+			block: block.ok_or_else(|| input.error("expected Block"))?,
+			node_block: node_block.ok_or_else(|| input.error("expected NodeBlock"))?,
+			unchecked_extrinsic: unchecked_extrinsic.ok_or_else(|| input.error("expected UncheckedExtrinsic"))?
 		})
 	}
 }
