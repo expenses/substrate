@@ -25,8 +25,9 @@ use client::{
 use chain_spec::{RuntimeGenesis, Extension};
 use codec::{Decode, Encode, IoReader};
 use consensus_common::import_queue::ImportQueue;
-use futures::{prelude::*, sync::mpsc};
-use futures03::{
+use futures::{
+	prelude::*,
+	channel::mpsc,
 	compat::Compat,
 	future::ready,
 	FutureExt as _, TryFutureExt as _,
@@ -631,9 +632,9 @@ pub trait ServiceBuilderImport {
 	/// Starts the process of importing blocks.
 	fn import_blocks(
 		self,
-		exit: impl Future<Item=(),Error=()> + Send + 'static,
+		exit: impl Future<Output = ()> + Send + 'static,
 		input: impl Read + Seek,
-	) -> Result<Box<dyn Future<Item = (), Error = ()> + Send>, Error>;
+	) -> Result<Box<dyn Future<Output = ()> + Send>, Error>;
 }
 
 /// Implemented on `ServiceBuilder`. Allows exporting blocks once you have given all the required
@@ -645,7 +646,7 @@ pub trait ServiceBuilderExport {
 	/// Performs the blocks export.
 	fn export_blocks(
 		&self,
-		exit: impl Future<Item=(),Error=()> + Send + 'static,
+		exit: impl Future<Output = ()> + Send + 'static,
 		output: impl Write,
 		from: NumberFor<Self::Block>,
 		to: Option<NumberFor<Self::Block>>,
@@ -682,9 +683,9 @@ impl<
 {
 	fn import_blocks(
 		self,
-		exit: impl Future<Item=(),Error=()> + Send + 'static,
+		exit: impl Future<Output = ()> + Send + 'static,
 		input: impl Read + Seek,
-	) -> Result<Box<dyn Future<Item = (), Error = ()> + Send>, Error> {
+	) -> Result<Box<dyn Future<Output = ()> + Send>, Error> {
 		let client = self.client;
 		let mut queue = self.import_queue;
 		import_blocks!(TBl, client, queue, exit, input)
@@ -704,7 +705,7 @@ where
 
 	fn export_blocks(
 		&self,
-		exit: impl Future<Item=(),Error=()> + Send + 'static,
+		exit: impl Future<Output = ()> + Send + 'static,
 		mut output: impl Write,
 		from: NumberFor<TBl>,
 		to: Option<NumberFor<TBl>>,
@@ -812,7 +813,7 @@ ServiceBuilder<
 
 		// List of asynchronous tasks to spawn. We collect them, then spawn them all at once.
 		let (to_spawn_tx, to_spawn_rx) =
-			mpsc::unbounded::<Box<dyn Future<Item = (), Error = ()> + Send>>();
+			mpsc::unbounded::<Box<dyn Future<Output = ()> + Send>>();
 
 		let import_queue = Box::new(import_queue);
 		let chain_info = client.info().chain;
@@ -1007,7 +1008,7 @@ ServiceBuilder<
 		let _ = to_spawn_tx.unbounded_send(Box::new(tel_task_2));
 
 		// RPC
-		let (system_rpc_tx, system_rpc_rx) = futures03::channel::mpsc::unbounded();
+		let (system_rpc_tx, system_rpc_rx) = futures::channel::mpsc::unbounded();
 		let gen_handler = || {
 			use rpc::{chain, state, author, system};
 
@@ -1151,7 +1152,7 @@ pub(crate) fn maintain_transaction_pool<Api, Backend, Block, Executor, PoolApi>(
 	client: &Arc<Client<Backend, Executor, Block, Api>>,
 	transaction_pool: &TransactionPool<PoolApi>,
 	retracted: &[Block::Hash],
-) -> error::Result<Box<dyn Future<Item = (), Error = ()> + Send>> where
+) -> error::Result<Box<dyn Future<Output = ()> + Send>> where
 	Block: BlockT<Hash = <Blake2Hasher as primitives::Hasher>::Out>,
 	Backend: 'static + client::backend::Backend<Block, Blake2Hasher>,
 	Client<Backend, Executor, Block, Api>: ProvideRuntimeApi,
@@ -1201,7 +1202,7 @@ pub(crate) fn maintain_transaction_pool<Api, Backend, Block, Executor, PoolApi>(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use futures03::executor::block_on;
+	use futures::executor::block_on;
 	use consensus_common::{BlockOrigin, SelectChain};
 	use substrate_test_runtime_client::{prelude::*, runtime::Transfer};
 

@@ -86,7 +86,8 @@ macro_rules! import_blocks {
 	use network::message;
 	use sr_primitives::generic::SignedBlock;
 	use sr_primitives::traits::Block;
-	use futures03::TryFutureExt as _;
+	use futures::TryFutureExt as _;
+	use std::task::Poll;
 
 	struct WaitLink {
 		imported_blocks: u64,
@@ -173,13 +174,13 @@ macro_rules! import_blocks {
 	}
 
 	let mut link = WaitLink::new();
-	Ok(futures::future::poll_fn(move || {
+	Ok(futures::future::poll_fn(move |_| {
 		if exit_recv.try_recv().is_ok() {
-			return Ok(Async::Ready(()));
+			return Ok(Poll::Ready(()));
 		}
 
 		let blocks_before = link.imported_blocks;
-		let _ = futures03::future::poll_fn(|cx| {
+		let _ = futures::future::poll_fn(|cx| {
 			$queue.poll_actions(cx, &mut link);
 			std::task::Poll::Pending::<Result<(), ()>>
 		}).compat().poll();
@@ -188,7 +189,7 @@ macro_rules! import_blocks {
 				"Stopping after #{} blocks because of an error",
 				link.imported_blocks,
 			);
-			return Ok(Async::Ready(()));
+			return Ok(Poll::Ready(()));
 		}
 		if link.imported_blocks / 1000 != blocks_before / 1000 {
 			info!(
@@ -199,9 +200,9 @@ macro_rules! import_blocks {
 		}
 		if link.imported_blocks >= count {
 			info!("Imported {} blocks. Best: #{}", block_count, $client.info().chain.best_number);
-			Ok(Async::Ready(()))
+			Ok(Poll::Ready(()))
 		} else {
-			Ok(Async::NotReady)
+			Ok(Poll::Pending)
 		}
 	}))
 }}

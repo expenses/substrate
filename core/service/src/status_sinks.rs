@@ -15,9 +15,11 @@
 // along with Substrate.  If not, see <http://www.gnu.org/licenses/>.
 
 use futures::prelude::*;
-use futures::sync::mpsc;
+use futures::channel::mpsc;
 use futures::stream::futures_unordered::FuturesUnordered;
 use std::time::{Duration, Instant};
+use std::task::{Poll, Context};
+use std::pin::Pin;
 use tokio_timer::Delay;
 
 /// Holds a list of `UnboundedSender`s, each associated with a certain time period. Every time the
@@ -47,7 +49,7 @@ impl<T> StatusSinks<T> {
 	/// The `interval` is the time period between two pushes on the sender.
 	pub fn push(&mut self, interval: Duration, sender: mpsc::UnboundedSender<T>) {
 		self.entries.push(YieldAfter {
-			delay: Delay::new(Instant::now() + interval),
+			delay: tokio_timer::delay_for(interval),
 			interval,
 			sender: Some(sender),
 		})
@@ -57,7 +59,7 @@ impl<T> StatusSinks<T> {
 	/// pushes what it returns to the sender.
 	///
 	/// This function doesn't return anything, but it should be treated as if it implicitly
-	/// returns `Ok(Async::NotReady)`. In particular, it should be called again when the task
+	/// returns `Ok(Poll::Pending)`. In particular, it should be called again when the task
 	/// is waken up.
 	///
 	/// # Panic
@@ -66,7 +68,7 @@ impl<T> StatusSinks<T> {
 	pub fn poll(&mut self, mut status_grab: impl FnMut() -> T) {
 		loop {
 			match self.entries.poll() {
-				Ok(Async::Ready(Some((sender, interval)))) => {
+				Ok(Poll::Ready(Some((sender, interval)))) => {
 					let status = status_grab();
 					if sender.unbounded_send(status).is_ok() {
 						self.entries.push(YieldAfter {
@@ -74,33 +76,31 @@ impl<T> StatusSinks<T> {
 							// waken up and the moment it is polled, the period is actually not
 							// `interval` but `interval + <delay>`. We ignore this problem in
 							// practice.
-							delay: Delay::new(Instant::now() + interval),
+							delay: tokio_timer::delay_for(interval),
 							interval,
 							sender: Some(sender),
 						});
 					}
 				}
 				Err(()) |
-				Ok(Async::Ready(None)) |
-				Ok(Async::NotReady) => break,
+				Ok(Poll::Ready(None)) |
+				Ok(Poll::Pending) => break,
 			}
 		}
 	}
 }
 
 impl<T> Future for YieldAfter<T> {
-	type Item = (mpsc::UnboundedSender<T>, Duration);
-	type Error = ();
+	type Output = (mpsc::UnboundedSender<T>, Duration);
 
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+	fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
 		match self.delay.poll() {
-			Ok(Async::NotReady) => Ok(Async::NotReady),
-			Ok(Async::Ready(())) => {
+			Poll::Pending => Poll::Pending,
+			Poll::Ready(()) => {
 				let sender = self.sender.take()
 					.expect("sender is always Some unless the future is finished; qed");
-				Ok(Async::Ready((sender, self.interval)))
-			},
-			Err(_) => Err(()),
+				Poll::Ready((sender, self.interval))
+			}
 		}
 	}
 }
@@ -125,9 +125,9 @@ mod tests {
 		let mut runtime = tokio::runtime::Runtime::new().unwrap();
 
 		let mut val_order = 5;
-		runtime.spawn(futures::future::poll_fn(move || {
+		runtime.spawn(futures::future::poll_fn(move |_| {
 			status_sinks.poll(|| { val_order += 1; val_order });
-			Ok(Async::NotReady)
+			Ok(Poll::Pending)
 		}));
 
 		let done = rx1

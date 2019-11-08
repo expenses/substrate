@@ -33,13 +33,16 @@ use std::net::SocketAddr;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use futures::sync::mpsc;
+use std::task::{Poll, Context};
+use std::pin::Pin;
+use futures::channel::mpsc;
 use parking_lot::Mutex;
 
 use client::{runtime_api::BlockT, Client};
 use exit_future::Signal;
 use futures::prelude::*;
-use futures03::{
+use futures::{
+	Stream, Future,
 	future::{ready, FutureExt as _, TryFutureExt as _},
 	stream::{StreamExt as _, TryStreamExt as _},
 };
@@ -66,8 +69,7 @@ pub use rpc::Metadata as RpcMetadata;
 pub use std::{ops::Deref, result::Result, sync::Arc};
 #[doc(hidden)]
 pub use network::{FinalityProofProvider, OnDemand, config::BoxFinalityProofRequestBuilder};
-#[doc(hidden)]
-pub use futures::future::Executor;
+use tokio_executor::Executor;
 
 const DEFAULT_PROTOCOL_ID: &str = "sup";
 
@@ -89,13 +91,13 @@ pub struct Service<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 	/// the service future is polled it should complete with an error.
 	essential_failed: Arc<AtomicBool>,
 	/// Sender for futures that must be spawned as background tasks.
-	to_spawn_tx: mpsc::UnboundedSender<Box<dyn Future<Item = (), Error = ()> + Send>>,
+	to_spawn_tx: mpsc::UnboundedSender<Box<dyn Future<Output = ()> + Send>>,
 	/// Receiver for futures that must be spawned as background tasks.
-	to_spawn_rx: mpsc::UnboundedReceiver<Box<dyn Future<Item = (), Error = ()> + Send>>,
+	to_spawn_rx: mpsc::UnboundedReceiver<Box<dyn Future<Output = ()> + Send>>,
 	/// List of futures to poll from `poll`.
 	/// If spawning a background task is not possible, we instead push the task into this `Vec`.
 	/// The elements must then be polled manually.
-	to_poll: Vec<Box<dyn Future<Item = (), Error = ()> + Send>>,
+	to_poll: Vec<Box<dyn Future<Output = ()> + Send>>,
 	rpc_handlers: rpc_servers::RpcHandler<rpc::Metadata>,
 	_rpc: Box<dyn std::any::Any + Send + Sync>,
 	_telemetry: Option<tel::Telemetry>,
@@ -106,24 +108,23 @@ pub struct Service<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> {
 }
 
 /// Alias for a an implementation of `futures::future::Executor`.
-pub type TaskExecutor = Arc<dyn Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Send + Sync>;
+pub type TaskExecutor = Arc<dyn Executor + Send + Sync>;
 
 /// An handle for spawning tasks in the service.
 #[derive(Clone)]
 pub struct SpawnTaskHandle {
-	sender: mpsc::UnboundedSender<Box<dyn Future<Item = (), Error = ()> + Send>>,
+	sender: mpsc::UnboundedSender<Box<dyn Future<Output = ()> + Send>>,
 	on_exit: exit_future::Exit,
 }
 
-impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for SpawnTaskHandle {
-	fn execute(
-		&self,
-		future: Box<dyn Future<Item = (), Error = ()> + Send>,
-	) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>> {
+impl Executor for SpawnTaskHandle {
+	fn spawn(
+		&mut self,
+		future: Pin<Box<dyn Future<Output = ()> + Send>>,
+	) -> Result<(), futures::task::SpawnError> {
 		let future = Box::new(future.select(self.on_exit.clone()).then(|_| Ok(())));
 		if let Err(err) = self.sender.unbounded_send(future) {
-			let kind = futures::future::ExecuteErrorKind::Shutdown;
-			Err(futures::future::ExecuteError::new(kind, err.into_inner()))
+			Err(futures::task::SpawnError::shutdown())
 		} else {
 			Ok(())
 		}
@@ -131,8 +132,8 @@ impl Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for SpawnTaskHandle
 }
 
 /// Abstraction over a Substrate service.
-pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
-	Executor<Box<dyn Future<Item = (), Error = ()> + Send>> + Send {
+pub trait AbstractService: 'static + Future<Output=()> +
+	Executor + Send {
 	/// Type of block of this chain.
 	type Block: BlockT<Hash = H256>;
 	/// Backend storage for the client.
@@ -155,12 +156,12 @@ pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
 	fn telemetry(&self) -> Option<tel::Telemetry>;
 
 	/// Spawns a task in the background that runs the future passed as parameter.
-	fn spawn_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static);
+	fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static);
 
 	/// Spawns a task in the background that runs the future passed as
 	/// parameter. The given task is considered essential, i.e. if it errors we
 	/// trigger a service exit.
-	fn spawn_essential_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static);
+	fn spawn_essential_task(&self, task: impl Future<Output = ()> + Send + 'static);
 
 	/// Returns a handle for spawning tasks.
 	fn spawn_task_handle(&self) -> SpawnTaskHandle;
@@ -177,7 +178,7 @@ pub trait AbstractService: 'static + Future<Item = (), Error = Error> +
 	///
 	/// If the request subscribes you to events, the `Sender` in the `RpcSession` object is used to
 	/// send back spontaneous events.
-	fn rpc_query(&self, mem: &RpcSession, request: &str) -> Box<dyn Future<Item = Option<String>, Error = ()> + Send>;
+	fn rpc_query(&self, mem: &RpcSession, request: &str) -> Box<dyn Future<Output = Option<String>> + Send>;
 
 	/// Get shared client instance.
 	fn client(&self) -> Arc<client::Client<Self::Backend, Self::CallExecutor, Self::Block, Self::RuntimeApi>>;
@@ -233,12 +234,12 @@ where
 		self.keystore.clone()
 	}
 
-	fn spawn_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static) {
+	fn spawn_task(&self, task: impl Future<Output = ()> + Send + 'static) {
 		let task = task.select(self.on_exit()).then(|_| Ok(()));
 		let _ = self.to_spawn_tx.unbounded_send(Box::new(task));
 	}
 
-	fn spawn_essential_task(&self, task: impl Future<Item = (), Error = ()> + Send + 'static) {
+	fn spawn_essential_task(&self, task: impl Future<Output = ()> + Send + 'static) {
 		let essential_failed = self.essential_failed.clone();
 		let essential_task = task.map_err(move |_| {
 			error!("Essential task failed. Shutting down service.");
@@ -256,7 +257,7 @@ where
 		}
 	}
 
-	fn rpc_query(&self, mem: &RpcSession, request: &str) -> Box<dyn Future<Item = Option<String>, Error = ()> + Send> {
+	fn rpc_query(&self, mem: &RpcSession, request: &str) -> Box<dyn Future<Output = Option<String>> + Send> {
 		Box::new(self.rpc_handlers.handle_request(request, mem.metadata.clone()))
 	}
 
@@ -290,17 +291,16 @@ where
 impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Future for
 	Service<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc>
 {
-	type Item = ();
-	type Error = Error;
+	type Output = ();
 
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+	fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
 		if self.essential_failed.load(Ordering::Relaxed) {
 			return Err(Error::Other("Essential task failed.".into()));
 		}
 
-		while let Ok(Async::Ready(Some(task_to_spawn))) = self.to_spawn_rx.poll() {
+		while let Ok(Poll::Ready(Some(task_to_spawn))) = self.to_spawn_rx.poll() {
 			let executor = tokio_executor::DefaultExecutor::current();
-			if let Err(err) = executor.execute(task_to_spawn) {
+			if let Err(err) = executor.spawn(task_to_spawn) {
 				debug!(
 					target: "service",
 					"Failed to spawn background task: {:?}; falling back to manual polling",
@@ -316,20 +316,19 @@ impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Future for
 		}
 
 		// The service future never ends.
-		Ok(Async::NotReady)
+		Poll::Pending
 	}
 }
 
-impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Executor<Box<dyn Future<Item = (), Error = ()> + Send>> for
+impl<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc> Executor for
 	Service<TBl, TCl, TSc, TNetStatus, TNet, TTxPool, TOc>
 {
-	fn execute(
-		&self,
-		future: Box<dyn Future<Item = (), Error = ()> + Send>
-	) -> Result<(), futures::future::ExecuteError<Box<dyn Future<Item = (), Error = ()> + Send>>> {
+	fn spawn(
+		&mut self,
+		future: Pin<Box<dyn Future<Output = ()> + Send>>
+	) -> Result<(), futures::task::SpawnError> {
 		if let Err(err) = self.to_spawn_tx.unbounded_send(future) {
-			let kind = futures::future::ExecuteErrorKind::Shutdown;
-			Err(futures::future::ExecuteError::new(kind, err.into_inner()))
+			Err(futures::task::SpawnError::shutdown())
 		} else {
 			Ok(())
 		}
@@ -349,30 +348,30 @@ fn build_network_future<
 	mut network: network::NetworkWorker<B, S, H>,
 	client: Arc<C>,
 	status_sinks: Arc<Mutex<status_sinks::StatusSinks<(NetworkStatus<B>, NetworkState)>>>,
-	rpc_rx: futures03::channel::mpsc::UnboundedReceiver<rpc::system::Request<B>>,
+	rpc_rx: futures::channel::mpsc::UnboundedReceiver<rpc::system::Request<B>>,
 	should_have_peers: bool,
 	dht_event_tx: Option<mpsc::Sender<DhtEvent>>,
-) -> impl Future<Item = (), Error = ()> {
+) -> impl Future<Output = ()> {
 	// Compatibility shim while we're transitioning to stable Futures.
 	// See https://github.com/paritytech/substrate/issues/3099
-	let mut rpc_rx = futures03::compat::Compat::new(rpc_rx.map(|v| Ok::<_, ()>(v)));
+	let mut rpc_rx = futures::compat::Compat::new(rpc_rx.map(|v| Ok::<_, ()>(v)));
 
 	let mut imported_blocks_stream = client.import_notification_stream().fuse()
 		.map(|v| Ok::<_, ()>(v)).compat();
 	let mut finality_notification_stream = client.finality_notification_stream().fuse()
 		.map(|v| Ok::<_, ()>(v)).compat();
 
-	futures::future::poll_fn(move || {
+	futures::future::poll_fn(move |_| {
 		let before_polling = Instant::now();
 
 		// We poll `imported_blocks_stream`.
-		while let Ok(Async::Ready(Some(notification))) = imported_blocks_stream.poll() {
+		while let Ok(Poll::Ready(Some(notification))) = imported_blocks_stream.poll() {
 			network.on_block_imported(notification.hash, notification.header, Vec::new(), notification.is_new_best);
 		}
 
 		// We poll `finality_notification_stream`, but we only take the last event.
 		let mut last = None;
-		while let Ok(Async::Ready(Some(item))) = finality_notification_stream.poll() {
+		while let Ok(Poll::Ready(Some(item))) = finality_notification_stream.poll() {
 			last = Some(item);
 		}
 		if let Some(notification) = last {
@@ -380,7 +379,7 @@ fn build_network_future<
 		}
 
 		// Poll the RPC requests and answer them.
-		while let Ok(Async::Ready(Some(request))) = rpc_rx.poll() {
+		while let Ok(Poll::Ready(Some(request))) = rpc_rx.poll() {
 			match request {
 				rpc::system::Request::Health(sender) => {
 					let _ = sender.send(rpc::system::Health {
@@ -439,7 +438,7 @@ fn build_network_future<
 		});
 
 		// Main network polling.
-		while let Ok(Async::Ready(Some(Event::Dht(event)))) = network.poll().map_err(|err| {
+		while let Ok(Poll::Ready(Some(Event::Dht(event)))) = network.poll().map_err(|err| {
 			warn!(target: "service", "Error in network: {:?}", err);
 		}) {
 			// Given that core/authority-discovery is the only upper stack consumer of Dht events at the moment, all Dht
@@ -464,7 +463,7 @@ fn build_network_future<
 			polling_dur
 		);
 
-		Ok(Async::NotReady)
+		Ok(Poll::Pending)
 	})
 }
 
@@ -650,7 +649,7 @@ where
 					})
 					.compat();
 
-				if let Err(e) = self.executor.execute(Box::new(import_future)) {
+				if let Err(e) = self.executor.spawn(Box::new(import_future)) {
 					warn!("Error scheduling extrinsic import: {:?}", e);
 				}
 			}
@@ -666,7 +665,7 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use futures03::executor::block_on;
+	use futures::executor::block_on;
 	use consensus_common::SelectChain;
 	use sr_primitives::traits::BlindCheckable;
 	use substrate_test_runtime_client::{prelude::*, runtime::{Extrinsic, Transfer}};
